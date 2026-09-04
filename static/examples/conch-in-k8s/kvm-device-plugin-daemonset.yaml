@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: conch-kvm-device-plugin
+  namespace: conch-system
+spec:
+  selector:
+    matchLabels: {app: conch-kvm-device-plugin}
+  template:
+    metadata:
+      labels: {app: conch-kvm-device-plugin}
+    spec:
+      nodeSelector:
+        conch.io/kvm: "true"
+      containers:
+        - name: device-plugin
+          image: hub.conch.com:5000/conch/conch-engine:v0.1-x86_64
+          command: [/usr/local/bin/conch-kvm-device-plugin]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile: {type: RuntimeDefault}
+          volumeMounts:
+            - name: device-plugins
+              mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+        - name: device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
