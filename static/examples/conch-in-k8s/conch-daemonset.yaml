@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: conch
+  namespace: conch-system
+spec:
+  selector:
+    matchLabels: {app: conch}
+  template:
+    metadata:
+      labels: {app: conch}
+    spec:
+      hostNetwork: false
+      dnsPolicy: ClusterFirst
+      hostAliases:
+        - ip: 10.0.0.10
+          hostnames: [hub.conch.com]
+      nodeSelector:
+        conch.io/kvm: "true"
+      containers:
+        - name: conchd
+          image: hub.conch.com:5000/conch/conch-engine:v0.1-x86_64
+          resources:
+            limits:
+              conch.io/kvm: "1"
+            requests:
+              conch.io/kvm: "1"
+          securityContext:
+            privileged: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              add: [NET_ADMIN, SYS_ADMIN]
+            seccompProfile: {type: Unconfined}
+            appArmorProfile: {type: Unconfined}
+          volumeMounts:
+            - {name: kvm, mountPath: /dev/kvm}
+            - {name: vsock, mountPath: /dev/vhost-vsock}
+            - {name: vsock-device, mountPath: /dev/vsock}
+            - {name: tun, mountPath: /dev/net/tun}
+            - {name: run, mountPath: /var/run/conch}
+            - {name: state, mountPath: /var/lib/conch}
+            - {name: deploy, mountPath: /opt/conch/deploy, readOnly: true}
+      volumes:
+        - {name: kvm, hostPath: {path: /dev/kvm, type: CharDevice}}
+        - {name: vsock, hostPath: {path: /dev/vhost-vsock, type: CharDevice}}
+        - {name: vsock-device, hostPath: {path: /dev/vsock, type: CharDevice}}
+        - {name: tun, hostPath: {path: /dev/net/tun, type: CharDevice}}
+        - name: run
+          hostPath:
+            path: /var/run/conch
+            type: DirectoryOrCreate
+        - name: state
+          hostPath:
+            path: /var/lib/conch
+            type: DirectoryOrCreate
+        - name: deploy
+          hostPath:
+            path: /opt/conch/deploy
+            type: Directory
