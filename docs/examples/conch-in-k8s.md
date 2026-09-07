@@ -21,7 +21,12 @@ sidebar_position: 1
 | KVM 设备 | `/dev/kvm` | 通过 device plugin 注入容器，供 StratoVirt 使用 KVM 加速 |
 | VSOCK 设备 | `/dev/vhost-vsock`、`/dev/vsock` | 通过 device plugin 注入容器，建立 conchd 与 conch-init 的 VSOCK 通信 |
 | TUN 设备 | `/dev/net/tun` | 通过 device plugin 注入容器，创建 Sandbox TAP 网络设备 |
+| Loop 设备 | `/dev/loop-control`、`/dev/loop0`～`/dev/loop7` | 通过 device plugin 注入容器，供 containerd EROFS snapshotter 挂载 rootfs 和 vm view 层 |
 | 内核特性 | `erofs` | 在节点内核启用 EROFS |
+
+> Loop 设备数量决定并发沙箱上限：每个并发沙箱的 EROFS vm view snapshot 各需占用一个 loop 设备，同一模板的 rootfs layer 文件可共享。device plugin 默认注入 loop0～loop7，支持 8 个并发沙箱；如需更多并发，在 device plugin `paths` 列表和节点 `/dev/loopN` 中补充。
+>
+> Loop 设备必须通过 device plugin 注入，不能用 hostPath volume。device plugin 会正确设置 cgroup 设备权限；hostPath 注入的块设备在容器内会报 `operation not permitted`。
 
 ## 镜像构建
 
@@ -42,7 +47,7 @@ docker run -d --restart=always --name conch-registry \
 echo "127.0.0.1 hub.conch.com" >> /etc/hosts
 ```
 
-容器运行时需要把该仓库识别为 HTTP（非 TLS）。containerd 通过 certs.d 目录配置：
+容器运行时需要把该仓库识别为 HTTP（非 TLS）。containerd 通过 certs d 目录配置：
 
 ```toml
 # /etc/containerd/certs.d/hub.conch.com:5000/hosts.toml
@@ -52,7 +57,7 @@ server = "http://hub.conch.com:5000"
   capabilities = ["pull", "resolve"]
 ```
 
-并在 containerd 主配置中启用 certs.d：
+并在 containerd 主配置中启用 certs d：
 
 ```toml
 # /etc/containerd/config.toml
@@ -106,6 +111,20 @@ docker push hub.conch.com:5000/conch/conch-engine:v0.1-x86_64
 
 > `openeuler` 沙箱模板由 `conch template create` 生成，需要已运行的 `conchd`，因此在 [沙箱管理](#沙箱管理) 中创建并推送到仓库。
 
+
+注意：
+1. **StratoVirt 编译**：从 [StratoVirt 源码](https://gitee.com/openeuler/stratovirt) 编译，必须开启特性：
+   ```bash
+   cargo build --release --bin stratovirt --features virtio_pmem,vhost_vsock,vhostuser_fs
+   ```
+   系统源自带的 StratoVirt（如 2.4.0）缺少 `virtio_pmem` 特性，会报 `Unsupported device: "virtio-pmem-pci"`。
+
+2. **Guest kernel**：ARM64 使用 `Image` 格式（非 x86 的 `bzImage`），通过 Conch 内核配置 `config/oe-kernel/aarch/.config` 编译。
+
+3. **镜像 tag**：ARM64 镜像建议使用 `v0.1-aarch64` tag 以区分 x86 镜像。
+
+
+
 ## 集群适配
 
 - 在 kubelet 配置中加入 `allowedUnsafeSysctls: [net.ipv4.ip_forward]` 并重启 kubelet，使 Conch 网络初始化可用。
@@ -113,6 +132,18 @@ docker push hub.conch.com:5000/conch/conch-engine:v0.1-x86_64
 - 节点 `iptables` 的 `FORWARD` 链默认策略需为 `ACCEPT`（或放行 Pod CIDR 到外网的转发），否则 Conch 在 Pod 网络命名空间内创建的 bridge、TAP 和 NAT 规则无法把 Sandbox 流量转发到外网。Docker 安装后常把 `FORWARD` 默认设为 `DROP`，需要恢复：
   ```bash
   iptables -P FORWARD ACCEPT
+  ```
+- 关闭 firewalld（会阻止 Pod 网络与节点通信）：
+  ```bash
+  systemctl stop firewalld
+  systemctl disable firewalld
+  ```
+- 单节点集群（control-plane 同时跑工作负载）需给 DaemonSet 加 toleration：
+  ```yaml
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
   ```
 - 给节点打标签 `conch.io/kvm=true`，使 device plugin 和 Conch DaemonSet 调度到该节点。
 
@@ -128,6 +159,11 @@ spec:
         - ip: 10.0.0.10
           hostnames: [hub.conch.com]
 ```
+
+> 容器内 PID 1 是 `conchd` 自身，重启时 pid 文件残留会导致 `Failed to acquire pid file` 错误。DaemonSet 通过 `command` 在启动前清理 pid 文件：
+> ```yaml
+> command: ["sh", "-c", "rm -f /var/run/conch/conchd.pid /var/run/conch/conchd.sock && exec conchd --config /etc/conch/config.yaml"]
+> ```
 
 验证节点已注册 `conch.io/kvm` 资源（device plugin 部署后才会出现）：
 
@@ -170,6 +206,8 @@ device plugin 在 `Allocate` 响应中注入设备和 `rwm` 权限。完整源�
 paths := []string{
     "/dev/kvm", "/dev/vhost-vsock", "/dev/vsock",
     "/dev/net/tun",
+    "/dev/loop-control", "/dev/loop0", "/dev/loop1", "/dev/loop2",
+    "/dev/loop3", "/dev/loop4", "/dev/loop5", "/dev/loop6", "/dev/loop7",
 }
 for _, path := range paths {
     devices = append(devices, &dp.DeviceSpec{
@@ -239,7 +277,9 @@ for sandbox_id in ("k8s-snapshot-start-1", "k8s-snapshot-start-2"):
     Sandbox.create(template_name=snapshot.template_name, sandbox_id=sandbox_id)
 ```
 
-脚本会打印每次启动耗时和 IP，以及命令执行结果（本示例单节点集群实测，`hostNetwork: false` + `hostAliases` 方案）：
+脚本会打印每次启动耗时和 IP，以及命令执行结果。以下为 x86_64 和 aarch64 单节点集群实测输出：
+
+**x86_64 实测**：
 
 ```console
 k8s-template-start: 0.473s, ip=10.13.0.72
@@ -254,7 +294,22 @@ k8s-snapshot-start-2 ensurepip exit=0
 k8s-snapshot-start-2 pip install math packages exit=0
 ```
 
-冷启动耗时约 0.47s，从快照模板首次启动约 1.39s（含 view 拉取），再次启动约 0.06s（view 已缓存）。三次启动均获得 IP，并成功执行命令。
+**aarch64 实测**：
+
+```console
+k8s-template-start: 2.148s, ip=10.13.0.52
+k8s-template-start ensurepip exit=0
+k8s-template-start pip install math packages exit=0
+snapshot template: hub.conch.com:5000/conch/openeuler-snapshot:latest (sha256:a56ede27b67b959b8874f5c4803aa37d1e434b0b127178c17232780d1aa2fea4)
+k8s-snapshot-start-1: 1.868s, ip=10.13.0.53
+k8s-snapshot-start-1 ensurepip exit=0
+k8s-snapshot-start-1 pip install math packages exit=0
+k8s-snapshot-start-2: 1.009s, ip=10.13.0.54
+k8s-snapshot-start-2 ensurepip exit=0
+k8s-snapshot-start-2 pip install math packages exit=0
+```
+
+x86_64 冷启动约 0.47s，aarch64 约 2.15s；从快照模板首次启动（含 view 拉取）x86 约 1.39s、ARM 约 1.87s；再次启动（view 已缓存）x86 约 0.06s、ARM 约 1.01s。三次启动均获得 IP 并成功执行命令。
 
 ### 沙箱执行命令
 

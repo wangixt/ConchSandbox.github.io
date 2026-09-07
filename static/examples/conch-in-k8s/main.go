@@ -29,7 +29,7 @@ func (s *server) ListAndWatch(_ *dp.Empty, stream dp.DevicePlugin_ListAndWatchSe
 func (s *server) Allocate(_ context.Context, req *dp.AllocateRequest) (*dp.AllocateResponse, error) {
 	resp := &dp.AllocateResponse{}
 	for range req.ContainerRequests {
-		paths := []string{"/dev/kvm", "/dev/vhost-vsock", "/dev/vsock", "/dev/net/tun"}
+		paths := []string{"/dev/kvm", "/dev/vhost-vsock", "/dev/vsock", "/dev/net/tun", "/dev/loop-control", "/dev/loop0", "/dev/loop1", "/dev/loop2", "/dev/loop3", "/dev/loop4", "/dev/loop5", "/dev/loop6", "/dev/loop7"}
 		devices := make([]*dp.DeviceSpec, 0, len(paths))
 		for _, path := range paths { devices = append(devices, &dp.DeviceSpec{HostPath: path, ContainerPath: path, Permissions: "rwm"}) }
 		resp.ContainerResponses = append(resp.ContainerResponses, &dp.ContainerAllocateResponse{Devices: devices})
