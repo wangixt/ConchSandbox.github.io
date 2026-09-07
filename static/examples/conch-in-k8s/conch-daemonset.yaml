@@ -20,6 +20,7 @@ spec:
       containers:
         - name: conchd
           image: hub.conch.com:5000/conch/conch-engine:v0.1-x86_64
+          command: ["sh", "-c", "rm -f /var/run/conch/conchd.pid /var/run/conch/conchd.sock && exec conchd --config /etc/conch/config.yaml"]
           resources:
             limits:
               conch.io/kvm: "1"
@@ -36,18 +37,10 @@ spec:
             seccompProfile: {type: Unconfined}
             appArmorProfile: {type: Unconfined}
           volumeMounts:
-            - {name: kvm, mountPath: /dev/kvm}
-            - {name: vsock, mountPath: /dev/vhost-vsock}
-            - {name: vsock-device, mountPath: /dev/vsock}
-            - {name: tun, mountPath: /dev/net/tun}
             - {name: run, mountPath: /var/run/conch}
             - {name: state, mountPath: /var/lib/conch}
             - {name: deploy, mountPath: /opt/conch/deploy, readOnly: true}
       volumes:
-        - {name: kvm, hostPath: {path: /dev/kvm, type: CharDevice}}
-        - {name: vsock, hostPath: {path: /dev/vhost-vsock, type: CharDevice}}
-        - {name: vsock-device, hostPath: {path: /dev/vsock, type: CharDevice}}
-        - {name: tun, hostPath: {path: /dev/net/tun, type: CharDevice}}
         - name: run
           hostPath:
             path: /var/run/conch
