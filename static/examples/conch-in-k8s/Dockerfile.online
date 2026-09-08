@@ -1,0 +1,36 @@
+# 在线构建：conch 及其依赖全部从 EPOL 仓库安装，需能访问 repo.openeuler.org 与 PyPI 镜像；离线场景用同目录的 Dockerfile。
+FROM hub.oepkgs.net/openeuler/openeuler:24.03-lts-sp4
+
+# 镜像自带的 [EPOL] 指向 EPOL/main，而 conch 与 erofs-utils 在 EPOL/update/main
+RUN printf '%s\n' '[EPOL-UPDATE]' 'name=EPOL-UPDATE' \
+      'baseurl=https://repo.openeuler.org/openEuler-24.03-LTS-SP4/EPOL/update/main/$basearch/' \
+      'enabled=1' 'gpgcheck=0' > /etc/yum.repos.d/epol-update.repo \
+    && dnf install -y conch erofs-utils \
+       ca-certificates iproute iptables iptables-nft util-linux pixman python3 python3-pip \
+    && dnf clean all
+
+# DaemonSet 的 hostPath 会盖住 /var/lib/conch，kernel/initrd 需挪到 /opt/conch
+RUN mkdir -p /opt/conch \
+    && cp /var/lib/conch/kernel /opt/conch/vmlinux.bin \
+    && cp /var/lib/conch/conch.initrd /opt/conch/conch-init.cpio.gz
+
+# 示例脚本默认在 /usr/local/bin 找二进制
+RUN ln -sf /usr/bin/conch /usr/local/bin/conch \
+    && ln -sf /usr/bin/conchd /usr/local/bin/conchd \
+    && ln -sf /usr/bin/conch-init /usr/local/bin/conch-init
+
+RUN pip3 install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ \
+      --trusted-host mirrors.aliyun.com /usr/share/conch/wheels/conch-*.whl
+
+COPY bin/conch-kvm-device-plugin /usr/local/bin/conch-kvm-device-plugin
+COPY build-cold-template.sh start-sandbox.py /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/conch-kvm-device-plugin \
+      /usr/local/bin/build-cold-template.sh /usr/local/bin/start-sandbox.py
+
+RUN mkdir -p /etc/conch/cni/net.d /var/run/conch /var/lib/conch \
+    && printf '%s\n' 'app:' '  name: conch-k8s' 'server:' '  work_dir: /var/run/conch' '  state_dir: /var/lib/conch' 'sandbox:' '  backend: stratovirt' 'network:' '  warm_pool_size: 1' '  cni:' '    plugin_bin_dirs:' '      - /usr/libexec/cni' > /etc/conch/config.yaml \
+    && printf '%s\n' '{"cniVersion":"1.0.0","name":"conch","type":"bridge","bridge":"cni-conch0","isGateway":true,"ipMasq":true,"ipam":{"type":"host-local","dataDir":"/var/lib/conch/cni","subnet":"10.13.0.0/24","routes":[{"dst":"0.0.0.0/0"}]},"dns":{"nameservers":["114.114.114.114","223.5.5.5"]}}' > /etc/conch/cni/net.d/10-conch.conf \
+    && chmod 0600 /etc/conch/config.yaml
+
+ENTRYPOINT ["/usr/local/bin/conchd"]
+CMD ["--config", "/etc/conch/config.yaml"]

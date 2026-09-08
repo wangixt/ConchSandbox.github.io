@@ -13,7 +13,6 @@ sidebar_position: 1
 
 | 依赖项 | 要求 | 运维操作 |
 | --- | --- | --- |
-| kubelet | `allowedUnsafeSysctls: [net.ipv4.ip_forward]` | 修改 kubelet 配置并重启 kubelet，使 Conch 网络初始化可用 |
 | 容器 capability | `NET_ADMIN` | 允许 Conch 配置 bridge、TAP、路由和 NAT 规则 |
 | 容器 capability | `SYS_ADMIN` | 允许 Conch 执行网络命名空间、挂载和文件系统操作 |
 | seccomp | `Unconfined` | 放行 StratoVirt、挂载和网络命名空间所需系统调用 |
@@ -22,6 +21,7 @@ sidebar_position: 1
 | VSOCK 设备 | `/dev/vhost-vsock`、`/dev/vsock` | 通过 device plugin 注入容器，建立 conchd 与 conch-init 的 VSOCK 通信 |
 | TUN 设备 | `/dev/net/tun` | 通过 device plugin 注入容器，创建 Sandbox TAP 网络设备 |
 | Loop 设备 | `/dev/loop-control`、`/dev/loop0`～`/dev/loop7` | 通过 device plugin 注入容器，供 containerd EROFS snapshotter 挂载 rootfs 和 vm view 层 |
+| `/proc/sys` | 容器内可写 | 在容器启动命令里 `mount -o remount,rw /proc/sys`，供 Conch 关闭 Sandbox 网络命名空间的 IPv6 并开启 IPv4 转发 |
 | 内核特性 | `erofs` | 在节点内核启用 EROFS |
 
 > Loop 设备数量决定并发沙箱上限：每个并发沙箱的 EROFS vm view snapshot 各需占用一个 loop 设备，同一模板的 rootfs layer 文件可共享。device plugin 默认注入 loop0～loop7，支持 8 个并发沙箱；如需更多并发，在 device plugin `paths` 列表和节点 `/dev/loopN` 中补充。
@@ -60,10 +60,22 @@ server = "http://hub.conch.com:5000"
 并在 containerd 主配置中启用 certs d：
 
 ```toml
-# /etc/containerd/config.toml
+# /etc/containerd/config.toml —— containerd 1.x
 [plugins."io.containerd.grpc.v1.cri".registry]
   config_path = "/etc/containerd/certs.d"
 ```
+
+containerd 2.x 的插件节名不同（`version = 3` 配置）：
+
+```toml
+# /etc/containerd/config.toml —— containerd 2.x
+[plugins.'io.containerd.cri.v1.images'.registry]
+  config_path = '/etc/containerd/certs.d'
+```
+
+> `config_path` 只接受**单个目录**。写成 `'/etc/containerd/certs.d:/etc/docker/certs.d'` 这类冒号分隔的多路径时，
+> containerd 不会报错，但整个 certs d 配置静默失效，拉取时报
+> `http: server gave HTTP response to HTTPS client`。
 
 若用 Docker 构建/推送镜像，在 `/etc/docker/daemon.json` 中添加：
 
@@ -80,13 +92,34 @@ systemctl restart docker
 
 > 如果你已有自己的镜像仓库，跳过本节，把后文的 `hub.conch.com:5000` 替换为你的仓库地址即可；TLS 仓库无需 `--plain-http`。
 
-### 构建 conch-engine 镜像
+### 获取构建产物
 
+Conch 以 RPM 形式发布在 openEuler 24.03-LTS 的 EPOL update 仓库（SP3、SP4 均有），包里已带编译好的二进制、guest kernel 和 initramfs，无需自行构建。**取包版本要与基础镜像一致**，本示例基础镜像是 `24.03-lts-sp4`，因此用 SP4 的包：
+
+```bash
+# 节点已配置 EPOL update 源时（仓库配置见 Dockerfile.online）
+dnf install -y conch erofs-utils
+
+# 或从包目录下载后直接解包，无需安装到节点
+# https://dl-cdn.openeuler.openatom.cn/openEuler-24.03-LTS-SP4/EPOL/update/main/x86_64/Packages/
+rpm2cpio conch-<版本>.oe2403sp4.x86_64.rpm | cpio -idm
+```
+
+包目录里取最新版本即可；aarch64 把路径中的 `x86_64` 换成 `aarch64`。注意 openEuler 自带的 `[EPOL]` 仓库指向 `EPOL/main/`，而 conch 与 erofs-utils 都在 `EPOL/update/main/`，`dnf` 路径需要另加仓库。`conch` 的依赖里含 `stratovirt`、`containernetworking-plugins`、`virtiofsd`、`iptables`，会一并装上。
+
+构建上下文中 `bin/` 的内容取自 RPM：`/usr/bin/conch`、`conchd`、`conch-init` 直接复制，`/var/lib/conch/kernel` 对应 `bin/vmlinux.bin`，`/var/lib/conch/conch.initrd` 对应 `bin/conch-init.cpio.gz`，Python SDK 为 `/usr/share/conch/wheels/conch-0.2.0-py3-none-any.whl`。
+
+RPM 未包含的两项：device plugin 由本文同目录的 [`main.go`](pathname:///examples/conch-in-k8s/main.go) 编译（`go build -o bin/conch-kvm-device-plugin ./main.go`）；`erofs-utils` 可从同一 EPOL 仓库安装，无法访问该仓库时从 [源码](https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git) 编译，下方示例 Dockerfile 用的就是后者。
+
+### 构建 conch-engine 镜像（离线）
+
+二进制、内核和 initramfs 都从构建上下文复制进镜像，构建过程只需访问基础镜像。
 使用 `hub.oepkgs.net/openeuler/openeuler:24.03-lts-sp4` 作为基础镜像，在镜像中编译 `mkfs.erofs`，并复制 Conch、StratoVirt、guest kernel、initramfs、device plugin、CNI 二进制和 SDK。[`Dockerfile`](pathname:///examples/conch-in-k8s/Dockerfile) 关键部分：
 
 ```dockerfile
 FROM hub.oepkgs.net/openeuler/openeuler:24.03-lts-sp4
 RUN dnf install -y iproute iptables util-linux containernetworking-plugins python3 python3-pip \
+    pixman \
     gcc make autoconf automake libtool pkgconf-pkg-config \
     libuuid-devel zlib-devel lz4-devel xz-devel zstd-devel \
     libcurl-devel openssl-devel libxml2-devel json-c-devel && dnf clean all
@@ -111,13 +144,29 @@ docker push hub.conch.com:5000/conch/conch-engine:v0.1-x86_64
 
 > `openeuler` 沙箱模板由 `conch template create` 生成，需要已运行的 `conchd`，因此在 [沙箱管理](#沙箱管理) 中创建并推送到仓库。
 
+### 构建 conch-engine 镜像（在线）
+
+[`Dockerfile.online`](pathname:///examples/conch-in-k8s/Dockerfile.online) 直接从 EPOL 仓库安装 conch、erofs-utils、StratoVirt 和 CNI 插件，
+构建上下文里只需要 device plugin 二进制和两个脚本。两种方式产出的镜像等价，按构建环境能否访问外网二选一：
+
+```bash
+docker build -f Dockerfile.online -t hub.conch.com:5000/conch/conch-engine:online-x86_64 .
+```
+
+要求构建环境能访问 `repo.openeuler.org` 与 PyPI 镜像。RPM 把 kernel 和 initramfs 装在 `/var/lib/conch`，
+而 DaemonSet 会把 hostPath 挂到该目录并盖住它们，所以 Dockerfile 中将其复制到 `/opt/conch`。
+
+> 本文的示例脚本需要 conch [`0.1.0-7`](https://atomgit.com/src-openeuler/Conch/pull/20) 及以上：`0.1.0-6` 的
+> `conch template create` 不支持 `--name`（模板名自动生成），SDK 的 `Sandbox.create()` 也只接受 `template_id`。
+
 
 注意：
-1. **StratoVirt 编译**：从 [StratoVirt 源码](https://gitee.com/openeuler/stratovirt) 编译，必须开启特性：
+1. **StratoVirt 特性**：必须包含 `virtio_pmem`、`vhost_vsock`、`vhostuser_fs`，否则会报
+   `Unsupported device: "virtio-pmem-pci"`。EPOL 仓库的 `stratovirt-2.4.0-14`（conch RPM 的依赖）已带这些特性。
+   如果从 [StratoVirt 源码](https://gitee.com/openeuler/stratovirt) 编译，必须开启这些特性：
    ```bash
    cargo build --release --bin stratovirt --features virtio_pmem,vhost_vsock,vhostuser_fs
    ```
-   系统源自带的 StratoVirt（如 2.4.0）缺少 `virtio_pmem` 特性，会报 `Unsupported device: "virtio-pmem-pci"`。
 
 2. **Guest kernel**：ARM64 使用 `Image` 格式（非 x86 的 `bzImage`），通过 Conch 内核配置 `config/oe-kernel/aarch/.config` 编译。
 
@@ -127,7 +176,6 @@ docker push hub.conch.com:5000/conch/conch-engine:v0.1-x86_64
 
 ## 集群适配
 
-- 在 kubelet 配置中加入 `allowedUnsafeSysctls: [net.ipv4.ip_forward]` 并重启 kubelet，使 Conch 网络初始化可用。
 - Conch Pod 使用 `hostNetwork: false` 与 `dnsPolicy: ClusterFirst`，保持 Pod 网络隔离；通过 `hostAliases` 把 `hub.conch.com` 注入 Pod 的 `/etc/hosts` 指向运行 registry 的节点 IP，使 Pod 内能解析并访问本地 registry。运行时目录和状态目录通过 hostPath 挂载到容器内的 `/var/run/conch` 和 `/var/lib/conch`，与节点共用同一目录。
 - 节点 `iptables` 的 `FORWARD` 链默认策略需为 `ACCEPT`（或放行 Pod CIDR 到外网的转发），否则 Conch 在 Pod 网络命名空间内创建的 bridge、TAP 和 NAT 规则无法把 Sandbox 流量转发到外网。Docker 安装后常把 `FORWARD` 默认设为 `DROP`，需要恢复：
   ```bash
@@ -160,9 +208,15 @@ spec:
           hostnames: [hub.conch.com]
 ```
 
-> 容器内 PID 1 是 `conchd` 自身，重启时 pid 文件残留会导致 `Failed to acquire pid file` 错误。DaemonSet 通过 `command` 在启动前清理 pid 文件：
+> 容器内 PID 1 是 `conchd` 自身，重启时 pid 文件残留会导致 `Failed to acquire pid file` 错误。同时容器的 `/proc/sys` 默认只读，
+> 而 Conch 预热网络池时要写 `/proc/sys/net/ipv6/conf/*` 关闭 IPv6，否则 conchd 启动即失败：
+> ```text
+> Failed to initialize server error=start network pool during startup: ... configure IPv4-only network namespace:
+> set IPv4-only sysctl /proc/sys/net/ipv6/conf/all/accept_ra: read-only file system
+> ```
+> DaemonSet 通过 `command` 在启动前重挂 `/proc/sys` 并清理 pid 文件（有 `SYS_ADMIN` 即可，无需 privileged）：
 > ```yaml
-> command: ["sh", "-c", "rm -f /var/run/conch/conchd.pid /var/run/conch/conchd.sock && exec conchd --config /etc/conch/config.yaml"]
+> command: ["sh", "-c", "mount -o remount,rw /proc/sys && rm -f /var/run/conch/conchd.pid /var/run/conch/conchd.sock && exec conchd --config /etc/conch/config.yaml"]
 > ```
 
 验证节点已注册 `conch.io/kvm` 资源（device plugin 部署后才会出现）：
@@ -183,7 +237,9 @@ kubectl apply -f conch-daemonset.yaml
 kubectl -n conch-system rollout status daemonset/conch --timeout=180s
 ```
 
-两个 DaemonSet 均使用 `hub.conch.com:5000/conch/conch-engine:v0.1-x86_64`。Conch 容器通过 device plugin 请求 KVM 资源，并添加必要 capability（[`conch-daemonset.yaml`](pathname:///examples/conch-in-k8s/conch-daemonset.yaml)）：
+两个 DaemonSet 均使用 `hub.conch.com:5000/conch/conch-engine:v0.1-x86_64`，并设置 `imagePullPolicy: Always`——镜像内容变化但 tag 不变时，默认策略不会重新拉取，`rollout restart` 仍会沿用节点上的旧镜像。
+
+Conch 容器通过 device plugin 请求 KVM 资源，并添加必要 capability（[`conch-daemonset.yaml`](pathname:///examples/conch-in-k8s/conch-daemonset.yaml)）：
 
 ```yaml
 securityContext:
@@ -194,11 +250,20 @@ securityContext:
     drop: [ALL]
     add: [NET_ADMIN, SYS_ADMIN]
   seccompProfile: {type: Unconfined}
-  appArmorProfile: {type: Unconfined}
+  appArmorProfile: {type: Unconfined}   # Kubernetes 1.30+
 resources:
   limits:
     conch.io/kvm: "1"
 ```
+
+> `appArmorProfile` 字段要求 Kubernetes 1.30+。1.29 及更早版本 apply 时会报
+> `strict decoding error: unknown field "spec.template.spec.containers[0].securityContext.appArmorProfile"`，
+> 改用 Pod 注解：
+> ```yaml
+> metadata:
+>   annotations:
+>     container.apparmor.security.beta.kubernetes.io/conchd: unconfined
+> ```
 
 device plugin 在 `Allocate` 响应中注入设备和 `rwm` 权限。完整源码见 [`main.go`](pathname:///examples/conch-in-k8s/main.go)，核心部分：
 
@@ -354,7 +419,8 @@ docker rm -f conch-registry
 
 | 文件 | 说明 |
 | --- | --- |
-| [`Dockerfile`](pathname:///examples/conch-in-k8s/Dockerfile) | `conch-engine` 镜像构建文件 |
+| [`Dockerfile`](pathname:///examples/conch-in-k8s/Dockerfile) | `conch-engine` 镜像构建文件（离线，二进制来自构建上下文） |
+| [`Dockerfile.online`](pathname:///examples/conch-in-k8s/Dockerfile.online) | `conch-engine` 镜像构建文件（在线，从 EPOL 仓库安装） |
 | [`build-image.sh`](pathname:///examples/conch-in-k8s/build-image.sh) | 构建并推送 `conch-engine` 镜像 |
 | [`main.go`](pathname:///examples/conch-in-k8s/main.go) | KVM device plugin 源码 |
 | [`kvm-device-plugin-daemonset.yaml`](pathname:///examples/conch-in-k8s/kvm-device-plugin-daemonset.yaml) | device plugin DaemonSet 清单 |

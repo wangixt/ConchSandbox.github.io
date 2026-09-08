@@ -9,6 +9,9 @@ spec:
   template:
     metadata:
       labels: {app: conch}
+      # Kubernetes 1.29 及更早版本没有 securityContext.appArmorProfile 字段，改用该注解：
+      # annotations:
+      #   container.apparmor.security.beta.kubernetes.io/conchd: unconfined
     spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
@@ -17,10 +20,18 @@ spec:
           hostnames: [hub.conch.com]
       nodeSelector:
         conch.io/kvm: "true"
+      # 单节点集群（control-plane 同时跑工作负载）需要该 toleration
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: conchd
           image: hub.conch.com:5000/conch/conch-engine:v0.1-x86_64
-          command: ["sh", "-c", "rm -f /var/run/conch/conchd.pid /var/run/conch/conchd.sock && exec conchd --config /etc/conch/config.yaml"]
+          # tag 不变时重推镜像后仍要重新拉取
+          imagePullPolicy: Always
+          # 容器 /proc/sys 默认只读，而 Conch 要在自建的 sandbox netns 里写 net.ipv6.conf.* 与 ip_forward
+          command: ["sh", "-c", "mount -o remount,rw /proc/sys && rm -f /var/run/conch/conchd.pid /var/run/conch/conchd.sock && exec conchd --config /etc/conch/config.yaml"]
           resources:
             limits:
               conch.io/kvm: "1"
@@ -35,7 +46,7 @@ spec:
               drop: [ALL]
               add: [NET_ADMIN, SYS_ADMIN]
             seccompProfile: {type: Unconfined}
-            appArmorProfile: {type: Unconfined}
+            appArmorProfile: {type: Unconfined}   # Kubernetes 1.30+
           volumeMounts:
             - {name: run, mountPath: /var/run/conch}
             - {name: state, mountPath: /var/lib/conch}

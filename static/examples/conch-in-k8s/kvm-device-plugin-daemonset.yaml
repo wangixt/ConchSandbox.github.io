@@ -12,9 +12,14 @@ spec:
     spec:
       nodeSelector:
         conch.io/kvm: "true"
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: device-plugin
           image: hub.conch.com:5000/conch/conch-engine:v0.1-x86_64
+          imagePullPolicy: Always
           command: [/usr/local/bin/conch-kvm-device-plugin]
           securityContext:
             runAsUser: 0

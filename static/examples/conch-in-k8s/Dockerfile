@@ -1,6 +1,7 @@
 FROM hub.oepkgs.net/openeuler/openeuler:24.03-lts-sp4
 
 RUN dnf install -y ca-certificates iproute iptables iptables-nft util-linux containernetworking-plugins python3 python3-pip \
+    pixman \
     gcc make autoconf automake libtool pkgconf-pkg-config \
     libuuid-devel zlib-devel lz4-devel xz-devel zstd-devel \
     libcurl-devel openssl-devel libxml2-devel json-c-devel \
